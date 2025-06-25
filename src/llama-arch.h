@@ -76,6 +76,7 @@ enum llm_arch {
     LLM_ARCH_WAVTOKENIZER_DEC,
     LLM_ARCH_PLM,
     LLM_ARCH_BAILINGMOE,
+    LLM_ARCH_EAGLE2_DRAFT,
     LLM_ARCH_UNKNOWN,
 };
 
@@ -364,6 +365,7 @@ enum llm_tensor {
     LLM_TENSOR_POS_NET_ATTN_K,
     LLM_TENSOR_POS_NET_ATTN_V,
     LLM_TENSOR_POS_NET_ATTN_OUT,
+    LLM_TENSOR_FC,
 };
 
 enum llm_tensor_layer {
