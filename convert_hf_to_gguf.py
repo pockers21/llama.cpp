@@ -1531,7 +1531,9 @@ class MmprojModel(ModelBase):
     preprocessor_config: dict[str, Any]
     global_config: dict[str, Any]
 
-    n_block_keys = ["n_layers", "num_hidden_layers", "n_layer", "num_layers", "depth"]
+    # Prefer explicit "layers"  (e.g. JinaCLIP),
+    # keep legacy keys for other models.
+    n_block_keys = ["layers", "n_layers", "num_hidden_layers", "n_layer", "num_layers", "depth"]
 
     has_vision_encoder: bool = True # by default
     has_audio_encoder: bool = False
@@ -1554,6 +1556,83 @@ class MmprojModel(ModelBase):
                 self.hparams["audio_config"] = {}
             text_config = {**self.hparams, **self.hparams["text_config"]}
             self.n_embd_text = text_config.get("hidden_size", text_config.get("n_embd", 0))
+
+            # Generic sub-model support: if hidden_size is missing, try to load the
+            # child text config via `hf_model_name_or_path` / `_name_or_path`.
+            # This is needed for architectures where the top-level config only
+            # stores a reference to the text tower (e.g. JinaCLIP v2, LLaVA),
+            # but does not duplicate its hidden_size / num_hidden_layers.
+            if self.n_embd_text == 0:
+                hf_name = text_config.get("hf_model_name_or_path") or text_config.get("_name_or_path")
+                cfg_kwargs = text_config.get("hf_model_config_kwargs") or {}
+                if isinstance(cfg_kwargs, dict):
+                    cfg_kwargs = dict(cfg_kwargs)
+                else:
+                    cfg_kwargs = {}
+
+                hidden: int | None = None
+                num_layers: int | None = None
+
+                # First try AutoConfig (may fail for dynamic configs when trust_remote_code=False)
+                if hf_name:
+                    try:
+                        subcfg = AutoConfig.from_pretrained(
+                            hf_name,
+                            trust_remote_code=False,
+                            **cfg_kwargs,
+                        )
+                    except Exception as e:
+                        logger.warning("mmproj: failed to load sub-model config %s: %s", hf_name, e)
+                        subcfg = None
+                    else:
+                        hidden_val = getattr(subcfg, "hidden_size", None) or getattr(subcfg, "d_model", None)
+                        if hidden_val is not None:
+                            hidden = int(hidden_val)
+                        nl_val = (
+                            getattr(subcfg, "num_hidden_layers", None)
+                            or getattr(subcfg, "num_layers", None)
+                            or getattr(subcfg, "depth", None)
+                        )
+                        if nl_val is not None:
+                            num_layers = int(nl_val)
+
+                    # If AutoConfig path did not give us the info (e.g. dynamic config
+                    # requiring trust_remote_code), fall back to reading raw config.json
+                    # via huggingface_hub to keep this logic data-only.
+                    if (hidden is None or num_layers is None) and hf_name:
+                        try:
+                            from huggingface_hub import hf_hub_download  # type: ignore[import]
+                        except Exception:
+                            hf_hub_download = None  # type: ignore[assignment]
+                        if hf_hub_download is not None:
+                            try:
+                                cfg_path = hf_hub_download(hf_name, "config.json", local_files_only=False)
+                                with open(cfg_path, "r", encoding="utf-8") as f:
+                                    cfg_json = json.load(f)
+                                if hidden is None:
+                                    hv = cfg_json.get("hidden_size") or cfg_json.get("d_model")
+                                    if hv is not None:
+                                        hidden = int(hv)
+                                if num_layers is None:
+                                    nl = (
+                                        cfg_json.get("num_hidden_layers")
+                                        or cfg_json.get("num_layers")
+                                        or cfg_json.get("depth")
+                                    )
+                                    if nl is not None:
+                                        num_layers = int(nl)
+                            except Exception as e:
+                                logger.warning("mmproj: failed to download sub-model raw config %s: %s", hf_name, e)
+
+                if hidden is not None:
+                    self.n_embd_text = hidden
+                    # Stash back into text_config so downstream helpers can reuse it.
+                    assert isinstance(self.hparams["text_config"], dict)
+                    self.hparams["text_config"].setdefault("hidden_size", self.n_embd_text)
+
+                if num_layers is not None:
+                    assert isinstance(self.hparams["text_config"], dict)
+                    self.hparams["text_config"].setdefault("num_hidden_layers", num_layers)
         else:
             text_config = {
                 k: v for k, v in self.hparams.items() if k not in ["vision_encoder", "audio_encoder"]
@@ -1567,16 +1646,23 @@ class MmprojModel(ModelBase):
         self.global_config = copy.deepcopy(self.hparams)
         self.hparams_vision = self.get_vision_config()
         self.hparams_audio = self.get_audio_config()
+        logger.debug(
+            "mmproj: global_config keys=%s, vision_config keys=%s",
+            sorted(self.global_config.keys()),
+            sorted(self.hparams_vision.keys()) if isinstance(self.hparams_vision, dict) else None,
+        )
 
         if self.hparams_vision is None and self.hparams_audio is None:
             raise ValueError("vision_config / audio_config not found in hparams")
 
         # for compat with vision-only models
         self.hparams = self.hparams_vision or self.hparams_audio or self.hparams
+        logger.debug("mmproj: encoder hparams keys: %s", sorted(self.hparams.keys()))
 
         # TODO @ngxson : this is a hack to support both vision and audio encoders
         have_multiple_encoders = self.has_audio_encoder and self.has_vision_encoder
         self.block_count = 128 if have_multiple_encoders else self.find_hparam(self.n_block_keys, True)
+        logger.debug("mmproj: block_count resolved as %r using keys %s", self.block_count, self.n_block_keys)
         self.tensor_map = gguf.get_tensor_name_map(gguf.MODEL_ARCH.MMPROJ, self.block_count)
 
         # load preprocessor config
@@ -6773,7 +6859,16 @@ class JinaCLIPVisionModel(MmprojModel):
                 "Please ensure the original model config is present; default hyperparameter fallbacks are not used."
             )
         with open(config_path, encoding="utf-8") as f:
-            self.vision_config = json.load(f)
+            cfg = json.load(f)
+        # For mixed checkpoints (e.g. jina-clip-v2), the vision encoder lives
+        # under the nested \"vision_config\" section. For vision-only exports,
+        # the file itself may already be a bare vision config.
+        self.vision_config = cfg.get("vision_config", cfg)
+
+    def get_vision_config(self) -> dict[str, Any] | None:
+        # Reuse the generic MmprojModel logic which reads the nested
+        # \"vision_config\" section from the global config.
+        return super().get_vision_config()
 
     def set_vocab(self):
         # Vision encoder doesn't need vocabulary
@@ -6829,76 +6924,10 @@ class JinaCLIPVisionModel(MmprojModel):
         self.gguf_writer.add_clip_projector_type(gguf.VisionProjectorType.JINACLIP2)
         self.gguf_writer.add_vision_use_silu(True)
 
-    def _strip_vm_prefix(self, name: str) -> str:
-        return name[len('vision_model.'):] if name.startswith('vision_model.') else name
-
-    def _map_block_tensor(self, layer: int, rest: str, data_torch: Tensor, name: str) -> list[tuple[str, Tensor]] | None:
-        parts = rest.split('.')
-        # layer norms
-        if rest.startswith('norm1.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ln1.{suffix}', data_torch)]
-        if rest.startswith('norm2.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ln2.{suffix}', data_torch)]
-        if rest.startswith('attn.inner_attn_ln.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.attn_ln.{suffix}', data_torch)]
-
-        if rest == 'attn.q_bias':
-            return [(f'v.blk.{layer}.attn_q.bias', data_torch)]
-        if rest == 'attn.v_bias':
-            return [(f'v.blk.{layer}.attn_v.bias', data_torch)]
-
-        if rest.startswith('attn.q_proj.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.attn_q.{suffix}', data_torch)]
-        if rest.startswith('attn.k_proj.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.attn_k.{suffix}', data_torch)]
-        if rest.startswith('attn.v_proj.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.attn_v.{suffix}', data_torch)]
-        if rest.startswith('attn.proj.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.attn_out.{suffix}', data_torch)]
-
-        # MLP
-        if rest.startswith('mlp.w1.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_gate.{suffix}', data_torch)]
-        if rest.startswith('mlp.w2.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_up.{suffix}', data_torch)]
-        if rest.startswith('mlp.w3.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_down.{suffix}', data_torch)]
-        if rest.startswith('mlp.ffn_ln.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_norm.{suffix}', data_torch)]
-        if rest.startswith('mlp.fc1.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_up.{suffix}', data_torch)]
-        if rest.startswith('mlp.fc2.'):
-            suffix = parts[-1]
-            return [(f'v.blk.{layer}.ffn_down.{suffix}', data_torch)]
-        return None
-
     def map_tensor_name(self, name: str, try_suffixes: Sequence[str] = (".weight", ".bias")) -> str:
-        """Prefer base table-driven mapping; keep Jina-specific targets if already mapped; fallback to legacy mapper."""
-        # Already a GGUF target name (e.g., "v.*" or "mm.*"): return as-is
         if name.startswith('v.') or name.startswith('mm.'):
             return name
-        # Try the base mapping first
-        try:
-            return super().map_tensor_name(name, try_suffixes=try_suffixes)
-        except Exception:
-            # Fallback to legacy Jina-specific mapper for any remaining edge keys
-            if hasattr(self, "_map_jinaclip_tensor_name"):
-                mapped = self._map_jinaclip_tensor_name(name)  # type: ignore[attr-defined]
-                if mapped:
-                    return mapped
-            return name
+        return super().map_tensor_name(name, try_suffixes=try_suffixes)
 
     def get_tensors(self) -> Iterator[tuple[str, Tensor]]:
         yielded_any = False
@@ -6939,43 +6968,141 @@ class JinaCLIPVisionModel(MmprojModel):
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
         del bid  # unused
 
+        # Strip optional \"vision_model.\" prefix used in mixed checkpoints so that
+        # the underlying table-driven mapping can stay prefix-agnostic.
         src = name
-        if src.startswith('v.') or src.startswith('mm.'):
-            return [(src, data_torch)]
+        if src.startswith("vision_model."):
+            src_no_vm = src[len("vision_model."):]
+        else:
+            src_no_vm = src
 
-        # Drop 'vision_model.' prefix if present
-        src_no_vm = self._strip_vm_prefix(src)
+        # keep tensors that are already mapped into GGUF space
+        if src_no_vm.startswith('v.') or src_no_vm.startswith('mm.'):
+            return [(src_no_vm, data_torch)]
 
         # Top-level direct mappings — use gguf constants directly for canonical names
         if src_no_vm == 'cls_token':
             base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_CLS]
             return [(base, data_torch)]
+
         if src_no_vm.startswith('patch_embed.proj.'):
             suffix = src_no_vm.split('.')[-1]
             base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_PATCH]
             return [(f'{base}.{suffix}', data_torch)]
+
         if src_no_vm == 'pos_embed':
             pos_name = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_ENC_EMBD_POS] + '.weight'
             return [(pos_name, data_torch)]
+
         if src_no_vm.startswith('norm.'):
             suffix = src_no_vm.split('.')[-1]
             base = gguf.TENSOR_NAMES[gguf.MODEL_TENSOR.V_POST_NORM]
             return [(f'{base}.{suffix}', data_torch)]
 
-        if src_no_vm.startswith('blocks.'):
-            parts = src_no_vm.split('.')
-            if len(parts) >= 3 and parts[1].isdigit():
-                layer = int(parts[1])
-                rest = '.'.join(parts[2:])
-                mapped = self._map_block_tensor(layer, rest, data_torch, name)
-                if mapped is not None:
-                    return mapped
-
         try:
-            return [(self.map_tensor_name(name), data_torch)]
+            return [(self.map_tensor_name(src_no_vm), data_torch)]
         except Exception:
             logger.debug("mmproj(jinaclip): skip unmapped tensor %s", name)
             return []
+
+    def _export_text_encoder_from_clip(self) -> None:
+        """
+        Best-effort export of the CLIP text encoder + its LoRA head
+        from a jina-clip-v2 mixed checkpoint into separate GGUF files.
+
+        This reuses the jina-embeddings-v3 configuration as hparams but
+        reads weights from the current directory (which contains the
+        text_model.transformer.roberta.* tensors for CLIP v2).
+        """
+        text_cfg = (self.global_config.get("text_config") or {}).copy()
+        hf_name = text_cfg.get("hf_model_name_or_path")
+        cfg_kwargs = text_cfg.get("hf_model_config_kwargs") or {}
+        if not hf_name:
+            logger.debug("jinaclip: no hf_model_name_or_path in text_config; skip text export")
+            return
+
+        # Load raw config.json of the text tower (e.g. jina-embeddings-v3)
+        try:
+            from huggingface_hub import hf_hub_download  # type: ignore[import]
+        except Exception:
+            logger.warning("jinaclip: huggingface_hub not available; skip text export")
+            return
+
+        try:
+            cfg_path = hf_hub_download(hf_name, "config.json", local_files_only=False)
+            with open(cfg_path, "r", encoding="utf-8") as f:
+                text_hparams: dict[str, Any] = json.load(f)
+        except Exception as e:
+            logger.warning("jinaclip: failed to download text sub-model config %s: %s", hf_name, e)
+            return
+
+        # Ensure Jina-specific LoRA metadata is present in hparams so that
+        # XLMRobertaModel can split adapters and add task metadata.
+        if isinstance(cfg_kwargs, dict):
+            # For jina-clip-v2 we want to override the generic v3 config with
+            # the CLIP-specific LoRA head (single \"retrieval.query\" task).
+            for key in ("lora_adaptations", "task_instructions", "lora_alpha"):
+                if key in cfg_kwargs:
+                    text_hparams[key] = cfg_kwargs[key]
+
+        # Ensure _name_or_path carries the HF id so XLMRobertaModel can
+        # detect JINA_BERT_V3 architecture.
+        text_hparams.setdefault("_name_or_path", hf_name)
+
+        # Choose text GGUF outfile based on mmproj filename by adding a prefix.
+        text_out = ModelBase.add_prefix_to_filename(self.fname_out, "text-")
+
+        logger.info("jinaclip: exporting text encoder to %s", text_out)
+        text_model = JinaCLIPTextV2Model(
+            self.dir_model,
+            self.ftype,
+            text_out,
+            is_big_endian=self.is_big_endian,
+            use_temp_file=self.use_temp_file,
+            eager=not self.lazy,
+            metadata_override=self.metadata_override,
+            model_name=self.model_name,
+            split_max_tensors=getattr(self, "split_max_tensors", 0),
+            split_max_size=getattr(self, "split_max_size", 0),
+            dry_run=self.dry_run,
+            small_first_shard=getattr(self, "small_first_shard", False),
+            hparams=text_hparams,
+            remote_hf_model_id=None,
+            disable_mistral_community_chat_template=self.disable_mistral_community_chat_template,
+            sentence_transformers_dense_modules=self.sentence_transformers_dense_modules,
+        )
+        text_model.write()
+
+    def write(self):
+        # First, try to export text encoder + its LoRA adapter GGUFs from the
+        # mixed jina-clip-v2 checkpoint. If anything goes wrong, log and
+        # continue with vision export so mmproj behaviour remains intact.
+        try:
+            self._export_text_encoder_from_clip()
+        except Exception as e:
+            logger.warning("jinaclip: text export failed, continuing with vision-only: %s", e)
+
+        # Then export the vision encoder as an MMPROJ GGUF as usual.
+        super().write()
+
+
+class JinaCLIPTextV2Model(XLMRobertaModel):
+    """Text encoder converter for jina-clip-v2 mixed checkpoints."""
+
+    model_arch = gguf.MODEL_ARCH.JINA_BERT_V3
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # Only consume tensors belonging to the text tower; anything else
+        # (e.g. logit_scale, vision_model.*) is ignored here.
+        if not name.startswith("text_model.transformer."):
+            return []
+
+        # Strip CLIP-specific prefix so that base XLMRobertaModel logic sees
+        # the usual \"roberta.*\" tensor names and can apply its Jina v3 LoRA
+        # handling (parametrizations.original + .0.lora_A/B).
+        name = name[len("text_model.transformer."):]
+        return super().modify_tensors(data_torch, name, bid)
+
+    # write() inherited from TextModel/XLMRobertaModel
 
 
 @ModelBase.register("OpenELMForCausalLM")
