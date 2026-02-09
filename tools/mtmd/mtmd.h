@@ -224,12 +224,29 @@ MTMD_API int32_t mtmd_encode_chunk(mtmd_context * ctx,
 
 // get output embeddings from the last encode pass
 // the reading size (in bytes) is equal to:
-// llama_model_n_embd(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
+// llama_model_n_embd_inp(model) * mtmd_input_chunk_get_n_tokens(chunk) * sizeof(float)
 MTMD_API float * mtmd_get_output_embd(mtmd_context * ctx);
 
 // Set callback for all future logging events.
 // If this is not called, or NULL is supplied, everything is output on stderr.
 MTMD_API void mtmd_log_set(ggml_log_callback log_callback, void * user_data);
+
+typedef struct mtmd_mmproj_context * mtmd_mmproj_context_t;
+
+// initialize a minimal context that only loads the projector
+MTMD_API mtmd_mmproj_context_t mtmd_mmproj_init(const char * mmproj_fname,
+                                                const struct mtmd_context_params ctx_params);
+
+// free projector-only context
+MTMD_API void mtmd_mmproj_free(mtmd_mmproj_context_t ctx);
+
+// encode a bitmap to projector embeddings
+// returns 0 on success, 1 on failure
+MTMD_API int32_t mtmd_mmproj_encode_bitmap(mtmd_mmproj_context_t ctx,
+                                           const mtmd_bitmap * bmp,
+                                           int32_t n_threads,
+                                           float ** out_data,
+                                           size_t * out_count);
 
 /////////////////////////////////////////
 
